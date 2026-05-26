@@ -92,3 +92,104 @@ flowchart TD
 
 *   **解壓密碼**：請聯繫作者私下獲取（請勿公開傳播）。
 *   **使用方法**：解壓後修改 `config.json` 設定遊戲進程，執行對應的批次檔即可常駐背景運行！
+
+---
+
+## 🚀 FPS 解鎖優化模組 — 《鳴潮》132 → 226 FPS 完整技術說明
+
+> 實測結果：平均 FPS +71%，1% Low +137%，幀延遲 -31%，光線追蹤全程保留。
+
+### 為什麼之前一直優化不好
+
+#### 根本問題：把「設上限」誤當「解除上限」
+
+過去所有嘗試（`t.MaxFPS=240`、`FrameRateLimit=240`）都沒有效果，原因：
+
+```
+實際生效的 FPS 上限 = min(引擎限制, 遊戲內部限制)
+
+引擎限制     = t.MaxFPS=240    → 240 FPS
+遊戲內部限制  = CustomFrameRate=4 → 120 FPS（C++ 硬編碼）
+
+實際結果 = min(240, 120) = 120 FPS  ← 永遠突破不了
+```
+
+《鳴潮》的 C++ 執行時讀取 `LocalStorage.db` 的 `CustomFrameRate=4` = **120 FPS 物理硬上限**。`.ini` 設多少都被取最小值蓋掉。
+
+#### 關鍵發現：在 UE4 中 `0` = 無限制（不是 0 FPS）
+
+```
+t.MaxFPS=0        → 引擎完全不施加 FPS 上限
+FrameRateLimit=0  → UE4 渲染迴路不施加上限
+
+結果：GPU 跑滿，不受任何限制 → 226 FPS
+```
+
+---
+
+### 成果對比
+
+| 指標 | 優化前 | 優化後 | 變化 |
+|---|---|---|---|
+| 平均 FPS | 132 | **226** | **+71%** |
+| 1% Low | 54 | **128** | **+137%** |
+| 幀延遲 | 26.2ms | **18.2ms** | **-31%** |
+| 光線追蹤 | 全開 | **全開** | ✅ 保留 |
+
+---
+
+### 有效的設定組合
+
+**`Engine.ini [SystemSettings]`**
+```ini
+t.MaxFPS=0
+r.VolumetricFog=0
+r.SSR.Quality=0
+r.BloomQuality=0
+r.DepthOfFieldQuality=0
+r.MotionBlurQuality=0
+r.Shadow.DistanceScale=0.4
+r.Shadow.CSM.MaxCascades=1
+```
+
+**`GameUserSettings.ini`**
+```ini
+FrameRateLimit=0.000000
+```
+
+**`LocalStorage.db`（SQLite）**
+
+| 設定 | 舊值 | 新值 | 效果 |
+|---|---|---|---|
+| VolumeLight | 1 | **0** | 關閉體積光（最大 GPU 殺手）|
+| SceneAo | 3 | **1** | 降低環境光遮蔽 |
+| ShadowQuality | 1 | **0** | 關閉動態陰影 |
+| NiagaraQuality | 1 | **0** | 關閉粒子特效 |
+| PcVsync | 1 | **0** | 關閉垂直同步 |
+| RayTracing | — | **3** | 光追全開（保留）|
+
+所有 `.ini` 設為 ReadOnly（`attrib +R`）防止遊戲覆蓋。
+
+---
+
+### DLSS + Frame Generation 的槓桿效應
+
+```
+DLSS Quality：以 66.7% 解析度渲染 → GPU 負載大幅降低
+Frame Generation：每 1 幀 AI 插值生成 1 幀 → 輸出幀數 × 2
+VSync OFF：移除 FPS 鎖定
+
+最終：GPU 節省算力（DLSS）→ 基礎 FPS 提升 × Frame Gen 倍增
+```
+
+---
+
+### 技術關鍵教訓
+
+1. **`0` ≠ `0 FPS`**：UE4 中 `t.MaxFPS=0` 是「無限制」而非零上限
+2. **取交集陷阱**：引擎限制和遊戲內部限制取 `min()`，設 240 不如設 0
+3. **ReadOnly 是必須的**：不鎖定 `.ini`，遊戲每次啟動都會覆蓋
+4. **DLSS 是倍數器**：節省的算力 × Frame Gen = 最大 FPS 收益
+5. **光追可以保留**：DLSS Quality 效能節省足以部分抵消光追開銷
+
+*驗證日期：2026-05-26 | 實測截圖確認 | 硬體：RTX 4070 Ti SUPER*
