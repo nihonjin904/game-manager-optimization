@@ -193,3 +193,116 @@ VSync OFF：移除 FPS 鎖定
 5. **光追可以保留**：DLSS Quality 效能節省足以部分抵消光追開銷
 
 *驗證日期：2026-05-26 | 實測截圖確認 | 硬體：RTX 4070 Ti SUPER*
+
+---
+
+## 🎮 《明日方舟：終末地》Unity 引擎優化技術說明
+
+> 引擎：Unity（Hypergryph 深度魔改版）| 硬體：RTX 4070 Ti Super | 結果：穩定 240 FPS
+
+### 關鍵發現：這款遊戲不是 UE5
+
+網上大量資料錯誤標注為 UE5。**實際是 Unity**，確認依據：
+
+| 文件 | 意義 |
+|---|---|
+| `UnityPlayer.dll` | Unity 主引擎 |
+| `GameAssembly.dll` | Unity IL2CPP 編譯輸出 |
+| `UnityCrashHandler64.exe` | Unity 崩潰處理器 |
+| `Endfield_Data/` | Unity 標準資料夾結構 |
+
+這個誤判直接導致用錯優化方法（UE4 的 `t.MaxFPS=0` 對 Unity 無效）。
+
+---
+
+### FPS 架構：120 × Frame Gen 2x = 240 FPS
+
+```
+遊戲限制層：HG Frame Pacing（Hypergryph 自製）→ 鎖 120 FPS base
+DLSS Frame Gen 2x → 輸出幀數 × 2 → 240 FPS 顯示
+GPU 使用率：~68%（設計如此，不是硬體不夠）
+```
+
+**為什麼 GPU 只用 10%（在設定頁面）**：
+設定頁面不啟用 Frame Gen，GPU 只渲染靜態畫面。進入遊戲後正常 68-98%。
+
+**為什麼不能直接突破 240**：
+HG Frame Pacing 是 Hypergryph 自己寫的穩幀系統，把 base 鎖在 120。DLSS 已是最新 v310（DLSS 4），但遊戲代碼沒有調用 MFG API，所以 UI 只能選 2x。
+
+---
+
+### 實際有效的優化操作
+
+**1. `boot.config` 加入 Incremental GC**
+
+路徑：`C:\Program Files\GRYPHLINK\games\Arknights Endfield\Endfield_Data\boot.config`
+
+```
+# 新增這一行
+incremental-gc=1
+```
+
+**邏輯**：Unity 的垃圾回收（GC）默認一次性清理記憶體，會短暫凍結執行緒（即「卡 1 秒」的元兇之一）。Incremental GC 把清理工作分散到多個幀執行，消除大卡頓換成小量持續工作。
+
+**2. 背景程式 RAM 清空**
+
+```powershell
+$apps = @("chrome","Discord","Spotify","OneDrive")
+foreach ($a in $apps) {
+    Add-Type -TypeDefinition 'using System;using System.Runtime.InteropServices;public class WS{[DllImport("psapi.dll")]public static extern bool EmptyWorkingSet(IntPtr h);}' -EA SilentlyContinue
+    Get-Process $a -EA SilentlyContinue | ForEach-Object { [WS]::EmptyWorkingSet($_.Handle) }
+}
+```
+
+**3. Windows 高性能電源計劃**
+
+```powershell
+powercfg /setactive 8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c
+```
+
+**4. 遊戲畫面設定（VRAM 吃滿）**
+
+| 設定 | 值 | 原因 |
+|---|---|---|
+| 紋理品質 | **極高** | 預載更多材質進 VRAM，減少串流卡頓 |
+| 畫質提升 | NVIDIA DLSS | |
+| DLSS 超解析度 | 品質 | |
+| 畫格生成 | DLSS Frame Generation 2x | |
+| 體積露 | **低** | 最大 GPU 殺手，關掉 FPS 提升最大 |
+| 螢幕空間反射 | **中** | |
+| 色差 | **OFF** | 無遊戲意義的後處理 |
+| 接觸陰影 | **OFF** | |
+
+---
+
+### 不能做的事（嘗試過，失敗原因）
+
+| 嘗試 | 結果 | 原因 |
+|---|---|---|
+| 移除 `HgFrameRateControl`（RuntimeInitializeOnLoads.json） | ❌ FPS 反而從 240 降到 162 | HG Frame Pacing 是穩幀系統，不是限制，移除讓 base FPS 不穩定 |
+| 修改 `gc-max-time-slice=33ms` | ❌ FPS 降低 | 33ms GC slice 在 4ms/幀的遊戲裡造成每幾幀大停頓 |
+| 修改 `config.ini` | ❌ 加密 | Hypergryph 使用自定義加密格式 |
+| 修改 `eld_Endfield.db` | ❌ 非標準 SQLite | 不是標準 SQLite 格式，加密或自定義結構 |
+| 換 DLSS DLL | ❌ 無效 | 遊戲已是 DLSS v310（DLSS 4），換 DLL 不能加 4x |
+
+---
+
+### 封號風險分析
+
+**不會封號。** 
+
+- 修改的是 `boot.config`（Unity 標準設定文件），等同於 UE 遊戲的 `Engine.ini`
+- 沒有修改任何執行檔（.exe/.dll）
+- 沒有記憶體注入或 DLL Hook
+- ACE-Guard 偵測的是執行期記憶體篡改和外部 Hook，不是本地設定文件
+- Hypergryph 官方啟動器提供「檔案完整性修復」選項可還原這些文件，說明開發商知道且接受玩家修改
+
+---
+
+### 給朋友解釋（白話版）
+
+> 遊戲把 FPS 鎖在 120（像汽車限速器），再用 AI 插幀翻倍到 240。  
+> 我們改的 `boot.config` 是 Unity 引擎的設定文件（相當於電腦的 BIOS 設定），讓記憶體清理更聰明。  
+> 沒有改遊戲本身，不會被封。就像你調整電腦的電源計劃，不是改系統檔案。
+
+*驗證日期：2026-05-27 | 硬體：RTX 4070 Ti Super*
